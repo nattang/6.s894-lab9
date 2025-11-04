@@ -46,8 +46,9 @@ __global__ void single_tma_store(__grid_constant__ const CUtensorMap src_map,
         0, 0,      //   int c0, int c1,
         &shmem     //   const void* smem_src
     );
+    // works w/o this though 
     tma_commit_group();
-    tma_wait_until_pending<1>();
+    tma_wait_until_pending<0>();
 }
 
 template <int TILE_M, int TILE_N>
