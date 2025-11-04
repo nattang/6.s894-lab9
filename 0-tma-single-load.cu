@@ -26,7 +26,7 @@ __global__ void single_tma_load(__grid_constant__ const CUtensorMap src_map,
     __shared__ bf16 shmem[TILE_M][TILE_N];
     __shared__ uint64_t bar;
 
-    init_barrier(&bar, 1); 
+    init_barrier(&bar, 1);
     async_proxy_fence();
 
     int expected_bytes = TILE_M * TILE_N * sizeof(bf16);
@@ -75,8 +75,8 @@ void launch_single_tma_load(bf16 *src, bf16 *dest)
     );
 
     CUDA_CHECK(descriptor);
-
-    single_tma_load<TILE_M, TILE_N><<<1, 1>>>(src_map, dest); // single block single lane
+    size_t shmem_size_bytes = TILE_M * TILE_N * sizeof(bf16) + sizeof(uint64_t);
+    single_tma_load<TILE_M, TILE_N><<<1, 1, shmem_size_bytes>>>(src_map, dest); // single block single lane
 }
 
 /// <--- /your code here --->
