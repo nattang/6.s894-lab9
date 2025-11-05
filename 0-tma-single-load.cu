@@ -39,7 +39,14 @@ __global__ void single_tma_load(__grid_constant__ const CUtensorMap src_map,
         &bar      // uint64_t* bar
     );
 
-    wait(&bar, 0);
+    // for (int i = 0; i < TILE_M; i++)
+    // {
+    //     for (int j = 0; j < TILE_N; j++)
+    //     {
+    //         dest[i * TILE_N + j] = 0;
+    //     }
+    // }
+    wait(&bar, 1);
 
     for (int i = 0; i < TILE_M; i++)
     {

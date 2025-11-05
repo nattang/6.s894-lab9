@@ -26,29 +26,32 @@ __global__ void single_tma_store(__grid_constant__ const CUtensorMap src_map,
     __shared__ bf16 shmem[TILE_M][TILE_N];
     __shared__ uint64_t bar;
 
-    init_barrier(&bar, 1);
-    async_proxy_fence();
+    if (threadIdx.x == 0)
+    {
+        init_barrier(&bar, 1);
+        async_proxy_fence();
 
-    int expected_bytes = TILE_M * TILE_N * sizeof(bf16);
-    expect_bytes_and_arrive(&bar, expected_bytes);
+        int expected_bytes = TILE_M * TILE_N * sizeof(bf16);
+        expect_bytes_and_arrive(&bar, expected_bytes);
 
-    cp_async_bulk_tensor_2d_global_to_shared(
-        &shmem,   // void* smem_dest,
-        &src_map, // const CUtensorMap* tensor_map,
-        0, 0,     // int c0, int c1,
-        &bar      // uint64_t* bar
-    );
+        cp_async_bulk_tensor_2d_global_to_shared(
+            &shmem,   // void* smem_dest,
+            &src_map, // const CUtensorMap* tensor_map,
+            0, 0,     // int c0, int c1,
+            &bar      // uint64_t* bar
+        );
 
-    wait(&bar, 0);
+        wait(&bar, 0);
 
-    cp_async_bulk_tensor_2d_shared_to_global(
-        &dest_map, // const CUtensorMap* tensor_map,
-        0, 0,      //   int c0, int c1,
-        &shmem     //   const void* smem_src
-    );
-    // works w/o this though 
-    tma_commit_group();
-    tma_wait_until_pending<0>();
+        cp_async_bulk_tensor_2d_shared_to_global(
+            &dest_map, // const CUtensorMap* tensor_map,
+            0, 0,      //   int c0, int c1,
+            &shmem     //   const void* smem_src
+        );
+    }
+    // works w/o this though
+    // tma_commit_group();
+    // tma_wait_until_pending<0>();
 }
 
 template <int TILE_M, int TILE_N>
