@@ -13,48 +13,74 @@ typedef __nv_bfloat16 bf16;
 
 /// <--- your code here --->
 
+
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 ////////////////////////////////////////////////////////////////////////////////
 // Part 3: TMA Memcpy
 ////////////////////////////////////////////////////////////////////////////////
-#define BLOCK_TILE_X 128
-#define BLOCK_TILE_Y 128
+#define NUM_WARPS_PER_BLOCK 4
+#define NUM_TILES_PER_WARP 4
+
+#define BLOCK_TILE_DIM 128
+#define BLOCK_TILE_ROWS BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * NUM_TILES_PER_WARP
 
 __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                          __grid_constant__ const CUtensorMap dest_tensor_map,
                          const int N)
 {
     // first iteration: have each block copy a tile
-    __shared__ bf16 shmem[BLOCK_TILE_X][BLOCK_TILE_Y];
-    __shared__ uint64_t bar;
+    extern __shared__ __align__(128) unsigned char shmem_raw[];
+    bf16(*shmem)[BLOCK_TILE_DIM] =
+        reinterpret_cast<bf16(*)[BLOCK_TILE_DIM]>(shmem_raw);
 
-    int tile_row = blockIdx.x * BLOCK_TILE_Y; // y offset in elements
+    size_t shmem_bf16_bytes = BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16);
+    uint64_t &bar = *reinterpret_cast<uint64_t *>(shmem_raw + shmem_bf16_bytes);
+
+    int tile_row = blockIdx.x * BLOCK_TILE_ROWS; // y offset in elements
     int tile_col = 0;
 
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+
+    int warp_row_offset = warp_id * BLOCK_TILE_DIM * NUM_TILES_PER_WARP;
+    // int rows_to_copy = MIN(BLOCK_TILE_DIM, N - (warp_row_offset + tile_row));
+
+    bool parity = 0;
     if (threadIdx.x == 0)
     {
-        init_barrier(&bar, 1);
+        init_barrier(&bar, NUM_WARPS_PER_BLOCK);
         async_proxy_fence();
+    }
+    __syncthreads();
 
-        int expected_bytes = BLOCK_TILE_X * BLOCK_TILE_Y * sizeof(bf16);
-        expect_bytes_and_arrive(&bar, expected_bytes);
+    for (int t = 0; t < NUM_TILES_PER_WARP; t++)
+    {
+        if (lane == 0)
+        {
+            int expected_bytes = BLOCK_TILE_DIM * BLOCK_TILE_DIM * sizeof(bf16);
+            expect_bytes_and_arrive(&bar, expected_bytes);
 
-        cp_async_bulk_tensor_2d_global_to_shared(
-            &shmem,      // void* smem_dest,
-            &tensor_map, // const CUtensorMap* tensor_map,
-            tile_row,
-            tile_col,        // int c0, int c1,
-            &bar         // uint64_t* bar
-        );
+            cp_async_bulk_tensor_2d_global_to_shared(
+                &shmem[BLOCK_TILE_DIM * warp_id][0], // void* smem_dest,
+                &tensor_map,                      // const CUtensorMap* tensor_map,
+                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
+                tile_col, // int c0, int c1,
+                &bar      // uint64_t* bar
+            );
 
-        wait(&bar, 0);
+            wait(&bar, parity);
+            parity = !parity;
 
-        cp_async_bulk_tensor_2d_shared_to_global(
-            &dest_tensor_map, // const CUtensorMap* tensor_map,
-            tile_row, tile_col,             //   int c0, int c1,
-            &shmem            //   const void* smem_src
-        );
+            cp_async_bulk_tensor_2d_shared_to_global(
+                &dest_tensor_map, // const CUtensorMap* tensor_map,
+                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
+                tile_col,
+                &shmem[BLOCK_TILE_DIM * warp_id][0] //   const void* smem_src
+            );
+        }
     }
 }
 
@@ -63,12 +89,12 @@ void launch_tma_copy(bf16 *dest, bf16 *src, int N)
     CUtensorMap src_map;
     CUtensorMap dest_map;
 
-    cuuint64_t map_y = N / BLOCK_TILE_X;
-    cuuint64_t map_x = BLOCK_TILE_X;
+    cuuint64_t map_y = N / BLOCK_TILE_DIM;
+    cuuint64_t map_x = BLOCK_TILE_DIM;
 
     cuuint64_t dims[2] = {map_y, map_x};
     cuuint64_t strides[2] = {map_y * sizeof(bf16), sizeof(bf16)};
-    cuuint32_t tile_dims[2] = {BLOCK_TILE_Y, BLOCK_TILE_X};
+    cuuint32_t tile_dims[2] = {BLOCK_TILE_DIM, BLOCK_TILE_DIM};
     cuuint32_t elem_strides[2] = {1, 1};
 
     CUresult src_descriptor = cuTensorMapEncodeTiled(
@@ -104,15 +130,18 @@ void launch_tma_copy(bf16 *dest, bf16 *src, int N)
     CUDA_CHECK(src_descriptor);
     CUDA_CHECK(dest_descriptor);
 
+    // double buffer for now
     size_t shmem_size_bytes =
-        BLOCK_TILE_Y * BLOCK_TILE_X * sizeof(bf16) + sizeof(uint64_t);
+        (BLOCK_TILE_DIM)*NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16) + sizeof(uint64_t);
     CUDA_CHECK(cudaFuncSetAttribute(
         tma_copy, cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
 
-    int num_blocks = CEIL_DIV(N, BLOCK_TILE_X * BLOCK_TILE_Y);
+    // printf("shmem_size_bytes = %zu\n", shmem_size_bytes);
+
+    int num_blocks = CEIL_DIV(N, BLOCK_TILE_DIM * BLOCK_TILE_ROWS);
     // printf("Launching %d blocks for TMA copy\n", num_blocks);
-    tma_copy<<<num_blocks, 32, shmem_size_bytes>>>(
+    tma_copy<<<num_blocks, NUM_WARPS_PER_BLOCK * 32, shmem_size_bytes>>>(
         src_map, dest_map, N);
 }
 
