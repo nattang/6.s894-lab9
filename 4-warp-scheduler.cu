@@ -140,9 +140,9 @@ void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N)
     CUDA_CHECK(src_descriptor);
     CUDA_CHECK(dest_descriptor);
 
-    // double buffer for now
-    size_t shmem_size_bytes =
-        (BLOCK_TILE_DIM)*NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16) + sizeof(uint64_t);
+    // size_t shmem_size_bytes =
+    //     (BLOCK_TILE_DIM)*NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16) + sizeof(uint64_t);
+    size_t shmem_size_bytes = 227 * 1000; // max 
     CUDA_CHECK(cudaFuncSetAttribute(
         tma_multiwarp_pipeline, cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
