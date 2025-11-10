@@ -22,7 +22,7 @@ typedef __nv_bfloat16 bf16;
 
 #define THREADS_PER_WARP 32
 #define WARPS_PER_BLOCK 4
-#define ROUNDS_PER_BLOCK 2
+#define ROUNDS_PER_BLOCK 4
 
 #define ARR_M (132 * 10 * 8)
 #define ARR_N (128 * 128 * 4)
@@ -40,8 +40,10 @@ tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
 
     size_t tile_bytes = 2 * size_t(THREADS_PER_WARP) * TILE_M * TILE_N * sizeof(bf16);
     size_t mbar_off   = (tile_bytes + 8) & ~size_t(8);
-    uint64_t *mbar0 = reinterpret_cast<uint64_t*>(smem_raw + mbar_off);
-    uint64_t *mbar1 = mbar0 + 1;
+    uint64_t *pmbar0 = reinterpret_cast<uint64_t*>(smem_raw + mbar_off);
+    uint64_t *pmbar1 = pmbar0 + 1;
+    uint64_t *cmbar0 = pmbar1 + 1; 
+    uint64_t *cmbar1 = cmbar0 + 1; 
 
     int warp_id = threadIdx.y;
     int lane = threadIdx.x;
@@ -51,8 +53,10 @@ tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
     int shared_offset = threadIdx.x * TILE_M * TILE_N;
 
     if (warp_id == 0 && lane == 0) {
-        init_barrier(mbar0, 32);
-        init_barrier(mbar1, 32);
+        init_barrier(pmbar0, 32);
+        init_barrier(pmbar1, 32);
+        init_barrier(cmbar0, 32);
+        init_barrier(cmbar1, 32);
         async_proxy_fence();
     }
 
@@ -60,41 +64,38 @@ tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
 
     for (uint round = 0; round < ROUNDS_PER_BLOCK; round++) {
         int tile_id_x = ((blockIdx.x * ROUNDS_PER_BLOCK * 32) + (round * 32) + threadIdx.x) * TILE_N;
-        uint64_t *cur_mbar = round & 1 ? mbar1 : mbar0;
+        uint64_t *cur_pmbar = round & 1 ? pmbar1 : pmbar0;
+        uint64_t *cur_cmbar = round & 1 ? cmbar1 : cmbar0;
 
         if (warp_id == 0) {
             if (round > 1) {
-                wait(cur_mbar, 1);
+                wait(cur_pmbar, ((round / 2) + 1) % 2); // wait on the last producer operation to finish writing
+                wait(cur_cmbar, ((round / 2) + 1) % 2); // wait on the previous round consumer operation to finish reading
             }
 
-            expect_bytes_and_arrive(cur_mbar, TILE_M*TILE_N*sizeof(bf16));
+            expect_bytes_and_arrive(cur_pmbar, TILE_M*TILE_N*sizeof(bf16));
 
             __syncwarp();
 
             bf16 * base_tile_addr = round & 1 ? tile_smem_b : tile_smem_a;
             
-            cp_async_bulk_tensor_2d_global_to_shared(&base_tile_addr[shared_offset], &tensor_map, tile_id_x, tile_id_y, cur_mbar);
-            
-            // wait(mbar, 0);
-
-            // cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, tile_id_x, tile_id_y, &tile_smem[shared_offset]);
-            
-            // __syncwarp();
-
-            // tma_commit_group();
-
-            // tma_wait_until_pending<0>();
+            cp_async_bulk_tensor_2d_global_to_shared(&base_tile_addr[shared_offset], &tensor_map, tile_id_x, tile_id_y, cur_pmbar);
 
         } else if (warp_id == 1) {
-            uint64_t *cur_mbar = round & 1 ? mbar1 : mbar0;
+            uint64_t *cur_pmbar = round & 1 ? pmbar1 : pmbar0;
+            uint64_t *cur_cmbar = round & 1 ? cmbar1 : cmbar0;
+            
+            if (round > 1) {
+                wait(cur_cmbar, ((round / 2) + 1) % 2);
+            }
 
-            wait(cur_mbar, 0);
+            wait(cur_pmbar, (round / 2) % 2);
 
             bf16 * base_tile_addr = round & 1 ? tile_smem_b : tile_smem_a;
 
             cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, tile_id_x, tile_id_y, &base_tile_addr[shared_offset]);
 
-            if (warp_id == 0 && lane == 0) {
+            if (lane == 0) {
                 tma_commit_group();
             }
             
@@ -102,7 +103,7 @@ tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
 
             tma_wait_until_pending<0>();
 
-            arrive(cur_mbar, 1);
+            arrive(cur_cmbar, 1);
 
             __syncwarp();
         }
