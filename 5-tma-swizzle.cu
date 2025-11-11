@@ -29,9 +29,40 @@ __global__ void tma_swizzle(__grid_constant__ const CUtensorMap src_map,
         datatype smem_buffer_abs[TILE_M * TILE_N + 128 * OFFSET];
     datatype *smem_buffer = &smem_buffer_abs[128 * OFFSET];
 
-    // Cast to a "shared pointer" so that it works with
-    // cp_async_bulk_tensor_2d_global_to_shared.
+    __shared__ alignas(8) uint64_t mbar;
 
+    int lane = threadIdx.x; 
+
+    if (lane == 0) {
+        init_barrier(&mbar, 1); 
+        async_proxy_fence();
+    }
+
+    __syncthreads();
+
+    if (lane == 0) {
+        cp_async_bulk_tensor_2d_global_to_shared(smem_buffer, &src_map, 0, 0, &mbar);
+        expect_bytes_and_arrive(&mbar, TILE_M * TILE_N * sizeof(datatype));
+    }
+    
+    wait(&mbar, 0);
+
+    for (int i = threadIdx.x; i < TILE_M; i+=blockDim.x) {
+        for (int j = threadIdx.y; j < TILE_N; j+=blockDim.y) {
+            uint64_t og_addr = reinterpret_cast<uint64_t>(&dest[i*TILE_N+j]);
+
+            uint64_t swizzle_switch = ((reinterpret_cast<uint64_t>(smem_buffer) >> 7) & 0b11) << 4;
+
+            datatype * new_addr = reinterpret_cast<datatype*>(og_addr ^ swizzle_switch);
+
+            *new_addr = smem_buffer[i * TILE_N + j];
+        }
+    }
+
+
+
+    // Cast to a "shared pointer" so that it works with
+    // cp_async_bulk_tensor_2d_global_to_shared
     /* TODO: your launch code here... */
 }
 
@@ -45,7 +76,35 @@ void launch_tma_swizzle(datatype *src, datatype *dest) {
      * kernel with the CU_TENSOR_MAP_SWIZZLE_64B setting.
      */
 
-    /* TODO: your launch code here... */
+    CUtensorMap src_map;
+
+    const cuuint64_t global_dim[2] = {TILE_N, TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_N * sizeof(datatype)};
+    const cuuint32_t box_dim[2] = {TILE_N,TILE_M};
+    const cuuint32_t element_strides[2] = {1,1};
+
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &src_map, 
+            CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2, 
+            src, 
+            global_dim, 
+            global_strides,
+            box_dim, 
+            element_strides, 
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        )
+    );
+
+    tma_swizzle<TILE_M, TILE_N, OFFSET><<<1,32>>>(src_map, dest);
+
+    datatype x[TILE_M*TILE_N]; 
+
+    CUDA_CHECK(cudaMemcpy(x, dest, TILE_M * TILE_N * sizeof(datatype), cudaMemcpyDeviceToHost));
 }
 
 /// <--- your code here --->
