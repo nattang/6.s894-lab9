@@ -14,11 +14,21 @@ typedef __nv_bfloat16 bf16;
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-#define NUM_WARPS_PER_BLOCK 4
-#define NUM_TILES_PER_WARP 4
+// #define NUM_WARPS_PER_BLOCK 4
+// #define ACTIVE_THREADS 4
+// #define NUM_TILES_PER_THREAD 4
 
-#define BLOCK_TILE_DIM 128
-#define BLOCK_TILE_ROWS BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * NUM_TILES_PER_WARP
+// #define BLOCK_TILE_DIM 256 // TODO: change this name
+#define THREADS_PER_WARP 32
+#define THREAD_TILE_DIM 32
+#define WARPS_PER_BLOCK 2
+#define PRODUCER_WARPS WARPS_PER_BLOCK / 2
+#define TILES_PER_THREAD 1
+
+#define BLOCK_TILE_X (THREAD_TILE_DIM * THREADS_PER_WARP)                   // 32 * 32 = 1024
+#define BLOCK_TILE_Y (THREAD_TILE_DIM * WARPS_PER_BLOCK * TILES_PER_THREAD) // 32 * 2 * 4 = 256
+
+// number of warps = block tile space / thread tile space / threads per warp
 
 ////////////////////////////////////////////////////////////////////////////////
 // Part 4: Bring Your Own Warp Scheduler
@@ -30,53 +40,139 @@ tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
                        const int N)
 {
     extern __shared__ __align__(128) unsigned char shmem_raw[];
-    bf16(*shmem)[BLOCK_TILE_DIM] =
-        reinterpret_cast<bf16(*)[BLOCK_TILE_DIM]>(shmem_raw);
 
-    size_t shmem_bf16_bytes = BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16);
-    uint64_t &bar = *reinterpret_cast<uint64_t *>(shmem_raw + shmem_bf16_bytes);
+    // size_t tile_bytes = THREAD_TILE_DIM * THREAD_TILE_DIM * THREADS_PER_WARP * PRODUCER_WARPS * sizeof(bf16);
+    // bf16 *tile0 = reinterpret_cast<bf16 *>(shmem_raw);
+    // bf16 *tile1 = reinterpret_cast<bf16 *>(reinterpret_cast<unsigned char *>(tile0) + tile_bytes);
 
-    int tile_row = blockIdx.x * BLOCK_TILE_ROWS; // y offset in elements
-    int tile_col = 0;
+    // // printf("tile_bytes = %lu\n", (unsigned long)tile_bytes);
+
+    // size_t mbar_off = (tile_bytes + 8) & ~size_t(8);
+    // uint64_t *pmbar0 = reinterpret_cast<uint64_t *>(reinterpret_cast<unsigned char *>(tile1) + mbar_off);
+    // uint64_t *pmbar1 = pmbar0 + 1;
+    // uint64_t *cmbar0 = pmbar1 + 1;
+    // uint64_t *cmbar1 = cmbar0 + 1;
+
+    bf16 *tile0 = reinterpret_cast<bf16 *>(shmem_raw);
+    bf16 *tile1 = tile0 + (THREADS_PER_WARP * THREAD_TILE_DIM * THREAD_TILE_DIM * PRODUCER_WARPS);
+
+    size_t tile_bytes = 2 * size_t(THREADS_PER_WARP) * THREAD_TILE_DIM * THREAD_TILE_DIM * PRODUCER_WARPS * sizeof(bf16);
+    size_t mbar_off = (tile_bytes + 8) & ~size_t(8);
+    uint64_t *pmbar0 = reinterpret_cast<uint64_t *>(shmem_raw + mbar_off);
+    uint64_t *pmbar1 = pmbar0 + 1;
+    uint64_t *cmbar0 = pmbar1 + 1;
+    uint64_t *cmbar1 = cmbar0 + 1;
+
+    int block_row = blockIdx.x * BLOCK_TILE_Y;
+    int block_col = 0;
 
     int lane = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
+    int producer_id = warp_id % PRODUCER_WARPS;
 
-    int warp_row_offset = warp_id * BLOCK_TILE_DIM * NUM_TILES_PER_WARP;
-    // int rows_to_copy = MIN(BLOCK_TILE_DIM, N - (warp_row_offset + tile_row));
+    // int shmem_offset = thread_id * THREAD_TILE_DIM * THREAD_TILE_DIM;
 
-    bool parity = 0;
+    int tile_row_base = producer_id * THREAD_TILE_DIM * TILES_PER_THREAD;
+    int tile_col_base = lane * THREAD_TILE_DIM;
+
     if (threadIdx.x == 0)
     {
-        init_barrier(&bar, NUM_WARPS_PER_BLOCK);
+        // init_barrier(&bar, THREADS_PER_WARP * WARPS_PER_BLOCK);
+        init_barrier(pmbar0, THREADS_PER_WARP);
+        init_barrier(pmbar1, THREADS_PER_WARP);
+        init_barrier(cmbar0, THREADS_PER_WARP);
+        init_barrier(cmbar1, THREADS_PER_WARP);
         async_proxy_fence();
     }
     __syncthreads();
 
-    for (int t = 0; t < NUM_TILES_PER_WARP; t++)
+    for (int t = 0; t < TILES_PER_THREAD; t++)
     {
-        if (lane == 0)
+        uint64_t *cur_pmbar = t & 1 ? pmbar1 : pmbar0;
+        uint64_t *cur_cmbar = t & 1 ? cmbar1 : cmbar0;
+
+        if (warp_id == 0)
         {
-            int expected_bytes = BLOCK_TILE_DIM * BLOCK_TILE_DIM * sizeof(bf16);
-            expect_bytes_and_arrive(&bar, expected_bytes);
+            if (t > 1)
+            {
+                wait(cur_pmbar, ((t / 2) + 1) % 2);
+                wait(cur_cmbar, ((t / 2) + 1) % 2);
+            }
+            if (lane == 0 && blockIdx.x == 0)
+                printf("block_row=%d, tile_row_base=%d, t*THREAD_TILE_DIM=%d, block_col=%d, tile_col_base=%d\n",
+                       block_row, tile_row_base, t * THREAD_TILE_DIM, block_col, tile_col_base);
+
+            // issue TMA load for tile (tile_row, tile_col)
+            int expected_bytes = THREAD_TILE_DIM * THREAD_TILE_DIM * sizeof(bf16);
+            expect_bytes_and_arrive(cur_pmbar, expected_bytes);
+            __syncwarp();
+
+            bf16 *base_tile_addr = t & 1 ? tile1 : tile0;
 
             cp_async_bulk_tensor_2d_global_to_shared(
-                &shmem[BLOCK_TILE_DIM * warp_id][0], // void* smem_dest,
-                &tensor_map,                         // const CUtensorMap* tensor_map,
-                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
-                tile_col, // int c0, int c1,
-                &bar      // uint64_t* bar
+                &base_tile_addr[lane * THREAD_TILE_DIM * THREAD_TILE_DIM],
+                &tensor_map, // const CUtensorMap* tensor_map,
+                block_row + tile_row_base + (t * THREAD_TILE_DIM),
+                block_col + tile_col_base, // int c0, int c1,
+                cur_pmbar                  // uint64_t* bar
             );
+        }
+        else if (warp_id == 1)
+        {
+            if (t > 1)
+            {
+                wait(cur_cmbar, ((t / 2) + 1) % 2);
+            }
 
-            wait(&bar, parity);
-            parity = !parity;
+            if (lane == 0 && blockIdx.x == 0)
+                printf("t=%d write buf=%d read buf=%d\n", t, (t & 1), (((t / 2)) % 2));
+
+            wait(cur_pmbar, (t / 2) % 2);
+
+            bf16 *base_tile_addr = t & 1 ? tile1 : tile0;
+
+            // print first 4 values of the tile being written back
+            // if (lane == 0 && blockIdx.x == 0)
+            // {
+            //     // printf("Tile to write back at t=%d:\n", t);
+
+            //     for (int i = 0; i < 4; i++)
+            //     {
+            //         bf16 val = base_tile_addr[lane * THREAD_TILE_DIM * THREAD_TILE_DIM + i];
+            //         printf("%.4f ", __bfloat162float(val));
+            //     }
+            //     printf("\n");
+            // }
 
             cp_async_bulk_tensor_2d_shared_to_global(
                 &dest_tensor_map, // const CUtensorMap* tensor_map,
-                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
-                tile_col,
-                &shmem[BLOCK_TILE_DIM * warp_id][0] //   const void* smem_src
+                block_row + tile_row_base + (t * THREAD_TILE_DIM),
+                block_col + tile_col_base,
+                &base_tile_addr[lane * THREAD_TILE_DIM * THREAD_TILE_DIM] //   const void* smem_src
             );
+
+            if (lane == 0 && blockIdx.x == 0)
+            {
+                printf("Tile to write back at t=%d:\n", t);
+                printf("block_row=%d, tile_row_base=%d, t*THREAD_TILE_DIM=%d, block_col=%d, tile_col_base=%d\n",
+                       block_row, tile_row_base, t * THREAD_TILE_DIM, block_col, tile_col_base);
+
+                for (int i = 0; i < 10; i++)
+                {
+                    bf16 val = base_tile_addr[lane * THREAD_TILE_DIM * THREAD_TILE_DIM + i];
+                    printf("%.4f ", __bfloat162float(val));
+                }
+                printf("\n");
+            }
+
+            // if (lane == 0)
+            // {
+            //     tma_commit_group();
+            // }
+            // __syncwarp();
+            // tma_wait_until_pending<0>();
+            // arrive(cur_cmbar, 1);
+            // __syncwarp();
         }
     }
 }
@@ -99,12 +195,12 @@ void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N)
     CUtensorMap src_map;
     CUtensorMap dest_map;
 
-    cuuint64_t map_y = N / BLOCK_TILE_DIM;
-    cuuint64_t map_x = BLOCK_TILE_DIM;
+    cuuint64_t map_y = N / BLOCK_TILE_X;
+    cuuint64_t map_x = BLOCK_TILE_X;
 
     cuuint64_t dims[2] = {map_y, map_x};
     cuuint64_t strides[2] = {map_y * sizeof(bf16), sizeof(bf16)};
-    cuuint32_t tile_dims[2] = {BLOCK_TILE_DIM, BLOCK_TILE_DIM};
+    cuuint32_t tile_dims[2] = {THREAD_TILE_DIM, THREAD_TILE_DIM};
     cuuint32_t elem_strides[2] = {1, 1};
 
     CUresult src_descriptor = cuTensorMapEncodeTiled(
@@ -142,17 +238,27 @@ void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N)
 
     // size_t shmem_size_bytes =
     //     (BLOCK_TILE_DIM)*NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16) + sizeof(uint64_t);
-    size_t shmem_size_bytes = 227 * 1000; // max 
+    size_t shmem_size_bytes = 227 * 1000; // max
     CUDA_CHECK(cudaFuncSetAttribute(
         tma_multiwarp_pipeline, cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
 
     // printf("shmem_size_bytes = %zu\n", shmem_size_bytes);
 
-    int num_blocks = CEIL_DIV(N, BLOCK_TILE_DIM * BLOCK_TILE_ROWS);
+    int num_blocks = CEIL_DIV(N, BLOCK_TILE_Y * BLOCK_TILE_X);
     // printf("Launching %d blocks for TMA copy\n", num_blocks);
-    tma_multiwarp_pipeline<<<num_blocks, NUM_WARPS_PER_BLOCK * 32, shmem_size_bytes>>>(
+    tma_multiwarp_pipeline<<<num_blocks, WARPS_PER_BLOCK * THREADS_PER_WARP, shmem_size_bytes>>>(
         src_map, dest_map, N);
+
+    // print first 16 values of dest:
+    // printf("First 16 values of dest after TMA copy:\n");
+    // bf16 host_dest[16];
+    // CUDA_CHECK(cudaMemcpy(host_dest, dest, 16 * sizeof(bf16),
+    //                       cudaMemcpyDeviceToHost));
+    // for (int i = 0; i < 16; i++)
+    // {
+    //     printf("%.4f ", __bfloat162float(host_dest[i]));
+    // }
 }
 
 /// <--- /your code here --->
@@ -237,15 +343,21 @@ int main()
                           cudaMemcpyDeviceToHost));
 
     bool tma_correct = true;
+    int num_incorrect = 0;
     for (int idx = 0; idx < size; idx++)
     {
         if (tma_result[idx] != matrix[idx])
         {
-            printf("First mismatch at [%d]: %.4f != %.4f\n", idx,
+            printf("mismatch at [%d]: %.4f != %.4f\n", idx,
                    __bfloat162float(tma_result[idx]),
                    __bfloat162float(matrix[idx]));
             tma_correct = false;
-            break;
+            // break;
+            num_incorrect++;
+            if (num_incorrect > 10)
+            {
+                break;
+            }
         }
     }
     printf("TMA Copy: %s\n\n", tma_correct ? "PASSED" : "FAILED");
