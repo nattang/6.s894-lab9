@@ -21,7 +21,7 @@ typedef __nv_bfloat16 bf16;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #define THREADS_PER_WARP 32
-#define WARPS_PER_BLOCK 4
+#define WARPS_PER_BLOCK 2
 #define ROUNDS_PER_BLOCK 4
 
 #define ARR_M (132 * 10 * 8)
@@ -168,7 +168,7 @@ void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N) {
         )
     );
 
-    dim3 block_size(32,4);
+    dim3 block_size(32,WARPS_PER_BLOCK);
 
     int num_blocks_m = CEIL_DIV(ARR_M, TILE_M);
     int num_blocks_n = CEIL_DIV(ARR_N, TILE_N * 32 * ROUNDS_PER_BLOCK);

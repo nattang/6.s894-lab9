@@ -19,7 +19,15 @@ typedef __nv_bfloat16 bf16;
 // Part 2: Single Block, Single Tile TMA Reduce
 ////////////////////////////////////////////////////////////////////////////////
 
-
+__device__ static __forceinline__ void
+cp_async_reduce_bulk_tensor_2d_shared_to_global(const CUtensorMap *tensor_map, int c0, int c1,  void *smem_src) {
+  asm volatile(
+      "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group "
+      "[%0, {%1, %2}], [%3];\n"
+      :
+      :"l"(tensor_map), "r"(c0), "r"(c1), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(smem_src)))
+      : "memory");
+}
 
 template <int TILE_M, int TILE_N>
 __global__ void
