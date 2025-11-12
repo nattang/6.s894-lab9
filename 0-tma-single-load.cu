@@ -21,69 +21,65 @@ typedef __nv_bfloat16 bf16;
 
 template <int TILE_M, int TILE_N>
 __global__ void single_tma_load(__grid_constant__ const CUtensorMap src_map,
-                                bf16 *dest)
-{
-    __shared__ bf16 shmem[TILE_M][TILE_N];
-    __shared__ uint64_t bar;
+                                bf16 *dest) {
+    
 
-    init_barrier(&bar, 1);
-    async_proxy_fence();
+    __shared__ alignas(8) uint64_t mbar;
+    __shared__ alignas(128) bf16 tile_smem[TILE_M * TILE_N];
 
-    int expected_bytes = TILE_M * TILE_N * sizeof(bf16);
-    expect_bytes_and_arrive(&bar, expected_bytes);
+    bool is_low_thread = threadIdx.x == 0 && threadIdx.y == 0;
 
-    cp_async_bulk_tensor_2d_global_to_shared(
-        &shmem,   // void* smem_dest,
-        &src_map, // const CUtensorMap* tensor_map,
-        0, 0,     // int c0, int c1,
-        &bar      // uint64_t* bar
-    );
+    if (is_low_thread) {
+        init_barrier(&mbar, 1);
+        async_proxy_fence();
+    }
 
-    // for (int i = 0; i < TILE_M; i++)
-    // {
-    //     for (int j = 0; j < TILE_N; j++)
-    //     {
-    //         dest[i * TILE_N + j] = 0;
-    //     }
-    // }
-    wait(&bar, 1);
+    __syncthreads();
 
-    for (int i = 0; i < TILE_M; i++)
-    {
-        for (int j = 0; j < TILE_N; j++)
-        {
-            dest[i * TILE_N + j] = shmem[i][j];
+    if (is_low_thread) {
+        expect_bytes_and_arrive(&mbar, TILE_M * TILE_N * sizeof(bf16));
+        cp_async_bulk_tensor_2d_global_to_shared(tile_smem, &src_map, 0, 0, &mbar);
+    }
+    
+    wait(&mbar, 0);
+
+    for (uint32_t idx_y = threadIdx.y; idx_y < TILE_M; idx_y+=blockDim.y) {
+        for (uint32_t idx_x = threadIdx.x; idx_x < TILE_N; idx_x+=blockDim.x) {
+      
+            dest[idx_y * TILE_N + idx_x] = tile_smem[idx_y * TILE_N + idx_x];
         }
     }
+
 }
 
 template <int TILE_M, int TILE_N>
-void launch_single_tma_load(bf16 *src, bf16 *dest)
-{
-    CUtensorMap src_map;
+void launch_single_tma_load(bf16 *src, bf16 *dest) {
+    CUtensorMap map; 
+    const cuuint64_t global_dim[2] = {TILE_N,TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_N * sizeof(bf16)};
+    const cuuint32_t box_dim[2] = {TILE_N,TILE_M};
+    const cuuint32_t element_strides[2] = {1,1};
 
-    cuuint64_t dims[2] = {TILE_N, TILE_M};
-    cuuint64_t strides[2] = {TILE_N * sizeof(bf16), sizeof(bf16)};
-    cuuint32_t tile_dims[2] = {TILE_N, TILE_M};
-    cuuint32_t elem_strides[2] = {1, 1};
-    CUresult descriptor = cuTensorMapEncodeTiled(
-        &src_map,                           // CUtensorMap* tensorMap,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,   // CUtensorMapDataType tensorDataType,
-        2,                                  // cuuint32_t tensorRank,
-        (void *)src,                        // void* globalAddress,
-        dims,                               // const cuuint64_t* globalDim,
-        strides,                            // const cuuint64_t* globalStrides,
-        tile_dims,                          // const cuuint32_t* boxDim,
-        elem_strides,                       // const cuuint32_t* elementStrides,
-        {CU_TENSOR_MAP_INTERLEAVE_NONE},    // CUtensorMapInterleave interleave,
-        {CU_TENSOR_MAP_SWIZZLE_NONE},       // CUtensorMapSwizzle swizzle,
-        {CU_TENSOR_MAP_L2_PROMOTION_NONE},  // CUtensorMapL2promotion l2Promotion,
-        {CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE} // CUtensorMapFloatOOBfill oobFill
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &map, 
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, 
+            src, 
+            global_dim, 
+            global_strides,
+            box_dim, 
+            element_strides, 
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        )
     );
 
-    CUDA_CHECK(descriptor);
-    size_t shmem_size_bytes = TILE_M * TILE_N * sizeof(bf16) + sizeof(uint64_t);
-    single_tma_load<TILE_M, TILE_N><<<1, 1, shmem_size_bytes>>>(src_map, dest); // single block single lane
+    dim3 block_size(16,16);
+
+    single_tma_load<TILE_M, TILE_N><<<1,block_size>>>(map, dest);
 }
 
 /// <--- /your code here --->
@@ -92,8 +88,7 @@ void launch_single_tma_load(bf16 *src, bf16 *dest)
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
 ////////////////////////////////////////////////////////////////////////////////
 
-int main()
-{
+int main() {
     const int M = 64;
     const int N = 128;
     const uint64_t total_size = M * N;
@@ -106,8 +101,7 @@ int main()
     cudaMalloc(&d_dest, total_size * sizeof(bf16));
 
     // Zero out destination buffer
-    for (int i = 0; i < total_size; i++)
-    {
+    for (int i = 0; i < total_size; i++) {
         matrix[i] = 0;
     }
     cudaMemcpy(d_dest, matrix, total_size * sizeof(bf16),
@@ -116,10 +110,8 @@ int main()
     // Initialize source matrix on host
     std::default_random_engine generator(0);
     std::normal_distribution<float> dist(0, 1);
-    for (int i = 0; i < M; i++)
-    {
-        for (int j = 0; j < N; j++)
-        {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
             float val = dist(generator);
             matrix[i * N + j] = __float2bfloat16(val);
         }
@@ -142,14 +134,12 @@ int main()
 
     // Verify correctness
     bool correct = true;
-    for (int x = 0; x < M * N; x++)
-    {
+    for (int x = 0; x < M * N; x++) {
         int i = x / N;
         int j = x % N;
         float ref = (float)matrix[i * N + j];
         float computed = (float)final_output[i * N + j];
-        if (ref != computed)
-        {
+        if (ref != computed) {
             correct = false;
             printf("Mismatch at (%d, %d): expected %f, got %f \n", i, j, ref,
                    computed);

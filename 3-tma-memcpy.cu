@@ -13,136 +13,180 @@ typedef __nv_bfloat16 bf16;
 
 /// <--- your code here --->
 
+////////////////////////////////////////////////////////////////////////////////
+// Part 3: TMA Memcpy
+////////////////////////////////////////////////////////////////////////////////
+
 
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-////////////////////////////////////////////////////////////////////////////////
-// Part 3: TMA Memcpy
-////////////////////////////////////////////////////////////////////////////////
-#define NUM_WARPS_PER_BLOCK 4
-#define NUM_TILES_PER_WARP 4
+#define THREADS_PER_WARP 32
+#define WARPS_PER_BLOCK 4
 
-#define BLOCK_TILE_DIM 128
-#define BLOCK_TILE_ROWS BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * NUM_TILES_PER_WARP
+#define ARR_M (132 * 10 * 8)
+#define ARR_N (128 * 128 * 4)
+
+constexpr int TILE_M = 32;
+constexpr int TILE_N = 32;
+
+// __shared__ alignas(8) uint64_t mbar;
+// __shared__ alignas(128) bf16 tile_smem[TILE_M * TILE_N];
+
+// bool is_low_thread = threadIdx.x == 0 && threadIdx.y == 0;
+
+// if (is_low_thread) {
+//     init_barrier(&mbar, 1);
+//     async_proxy_fence();
+// }
+
+// __syncthreads();
+
+// if (is_low_thread) {
+//     expect_bytes_and_arrive(&mbar, TILE_M * TILE_N * sizeof(bf16));
+//     cp_async_bulk_tensor_2d_global_to_shared(tile_smem, &src_map, 0, 0, &mbar);
+// }
+
+// wait(&mbar, 0);
+
+
+// if (is_low_thread) {
+//     cp_async_bulk_tensor_2d_shared_to_global(&dest_map, 0, 0, tile_smem);
+// }
+
+// __syncthreads();
+
+// tma_commit_group();
+
+// tma_wait_until_pending<0>();
 
 __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                          __grid_constant__ const CUtensorMap dest_tensor_map,
-                         const int N)
-{
-    // first iteration: have each block copy a tile
-    extern __shared__ __align__(128) unsigned char shmem_raw[];
-    bf16(*shmem)[BLOCK_TILE_DIM] =
-        reinterpret_cast<bf16(*)[BLOCK_TILE_DIM]>(shmem_raw);
+                         const int N) {
+    
+    extern __shared__ __align__(128) unsigned char smem_raw[];              
+    bf16 *tile_smem = reinterpret_cast<bf16*>(smem_raw);
+    size_t tile_bytes = size_t(THREADS_PER_WARP) * TILE_M * TILE_N * sizeof(bf16);
+    size_t mbar_off   = (tile_bytes + 8) & ~size_t(8);
+    uint64_t *mbar = reinterpret_cast<uint64_t*>(smem_raw + mbar_off);
 
-    size_t shmem_bf16_bytes = BLOCK_TILE_DIM * NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16);
-    uint64_t &bar = *reinterpret_cast<uint64_t *>(shmem_raw + shmem_bf16_bytes);
+    int warp_id = threadIdx.y;
+    int lane = threadIdx.x;
 
-    int tile_row = blockIdx.x * BLOCK_TILE_ROWS; // y offset in elements
-    int tile_col = 0;
+    int tile_id_x = (blockIdx.x * 32 + threadIdx.x) * TILE_M;
+    int tile_id_y = blockIdx.y * TILE_N;
 
-    int lane = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
+    int shared_offset = threadIdx.x * TILE_M * TILE_N;
 
-    int warp_row_offset = warp_id * BLOCK_TILE_DIM * NUM_TILES_PER_WARP;
-    // int rows_to_copy = MIN(BLOCK_TILE_DIM, N - (warp_row_offset + tile_row));
-
-    bool parity = 0;
-    if (threadIdx.x == 0)
-    {
-        init_barrier(&bar, NUM_WARPS_PER_BLOCK);
+    if (warp_id == 0 && lane == 0) {
+        init_barrier(mbar, 32);
         async_proxy_fence();
     }
+
     __syncthreads();
 
-    for (int t = 0; t < NUM_TILES_PER_WARP; t++)
-    {
-        if (lane == 0)
-        {
-            int expected_bytes = BLOCK_TILE_DIM * BLOCK_TILE_DIM * sizeof(bf16);
-            expect_bytes_and_arrive(&bar, expected_bytes);
+    if (warp_id == 0) {
+        expect_bytes_and_arrive(mbar, TILE_M*TILE_N*sizeof(bf16));
+        
+        cp_async_bulk_tensor_2d_global_to_shared(&tile_smem[shared_offset], &tensor_map, tile_id_x, tile_id_y, mbar);
+        
+        // wait(mbar, 0);
 
-            cp_async_bulk_tensor_2d_global_to_shared(
-                &shmem[BLOCK_TILE_DIM * warp_id][0], // void* smem_dest,
-                &tensor_map,                      // const CUtensorMap* tensor_map,
-                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
-                tile_col, // int c0, int c1,
-                &bar      // uint64_t* bar
-            );
+        // cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, tile_id_x, tile_id_y, &tile_smem[shared_offset]);
+        
+        // __syncwarp();
 
-            wait(&bar, parity);
-            parity = !parity;
+        // tma_commit_group();
 
-            cp_async_bulk_tensor_2d_shared_to_global(
-                &dest_tensor_map, // const CUtensorMap* tensor_map,
-                tile_row + warp_row_offset + (BLOCK_TILE_DIM * t),
-                tile_col,
-                &shmem[BLOCK_TILE_DIM * warp_id][0] //   const void* smem_src
-            );
-        }
+        // tma_wait_until_pending<0>();
+
+    } else if (warp_id == 2) {
+        wait(mbar, 0);
+
+        cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, tile_id_x, tile_id_y, &tile_smem[shared_offset]);
+
+        __syncwarp();
+
+        tma_commit_group();
+        
     }
+
+    // wait(mbar, 0);
+
+
+    // if (warp_id == 0) {
+    //     cp_async_bulk_tensor_2d_shared_to_global(&dest_tensor_map, tile_id_x, tile_id_y, &tile_smem[shared_offset]);
+    // }
+
+    // __syncthreads();
+
+    // tma_commit_group();
+
+    // tma_wait_until_pending<0>();
+    
 }
 
-void launch_tma_copy(bf16 *dest, bf16 *src, int N)
-{
+void launch_tma_copy(bf16 *dest, bf16 *src, int N) {
     CUtensorMap src_map;
-    CUtensorMap dest_map;
 
-    cuuint64_t map_y = N / BLOCK_TILE_DIM;
-    cuuint64_t map_x = BLOCK_TILE_DIM;
+    const cuuint64_t global_dim[2] = {ARR_N, ARR_M};
+    const cuuint64_t global_strides[1] = {ARR_N * sizeof(bf16)};
+    const cuuint32_t box_dim[2] = {TILE_N,TILE_M};
+    const cuuint32_t element_strides[2] = {1,1};
 
-    cuuint64_t dims[2] = {map_y, map_x};
-    cuuint64_t strides[2] = {map_y * sizeof(bf16), sizeof(bf16)};
-    cuuint32_t tile_dims[2] = {BLOCK_TILE_DIM, BLOCK_TILE_DIM};
-    cuuint32_t elem_strides[2] = {1, 1};
-
-    CUresult src_descriptor = cuTensorMapEncodeTiled(
-        &src_map,                           // CUtensorMap* tensorMap,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,   // CUtensorMapDataType tensorDataType,
-        2,                                  // cuuint32_t tensorRank,
-        (void *)src,                        // void* globalAddress,
-        dims,                               // const cuuint64_t* globalDim,
-        strides,                            // const cuuint64_t* globalStrides,
-        tile_dims,                          // const cuuint32_t* boxDim,
-        elem_strides,                       // const cuuint32_t* elementStrides,
-        {CU_TENSOR_MAP_INTERLEAVE_NONE},    // CUtensorMapInterleave interleave,
-        {CU_TENSOR_MAP_SWIZZLE_NONE},       // CUtensorMapSwizzle swizzle,
-        {CU_TENSOR_MAP_L2_PROMOTION_NONE},  // CUtensorMapL2promotion l2Promotion,
-        {CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE} // CUtensorMapFloatOOBfill oobFill
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &src_map, 
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, 
+            src, 
+            global_dim, 
+            global_strides,
+            box_dim, 
+            element_strides, 
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        )
     );
 
-    CUresult dest_descriptor = cuTensorMapEncodeTiled(
-        &dest_map,                          // CUtensorMap* tensorMap,
-        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,   // CUtensorMapDataType tensorDataType,
-        2,                                  // cuuint32_t tensorRank,
-        (void *)dest,                       // void* globalAddress,
-        dims,                               // const cuuint64_t* globalDim,
-        strides,                            // const cuuint64_t* globalStrides,
-        tile_dims,                          // const cuuint32_t* boxDim,
-        elem_strides,                       // const cuuint32_t* elementStrides,
-        {CU_TENSOR_MAP_INTERLEAVE_NONE},    // CUtensorMapInterleave interleave,
-        {CU_TENSOR_MAP_SWIZZLE_NONE},       // CUtensorMapSwizzle swizzle,
-        {CU_TENSOR_MAP_L2_PROMOTION_NONE},  // CUtensorMapL2promotion l2Promotion,
-        {CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE} // CUtensorMapFloatOOBfill oobFill
+
+    CUtensorMap dest_map; 
+
+    CUDA_CHECK(
+        cuTensorMapEncodeTiled(
+            &dest_map, 
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, 
+            dest, 
+            global_dim, 
+            global_strides,
+            box_dim, 
+            element_strides, 
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        )
     );
 
-    CUDA_CHECK(src_descriptor);
-    CUDA_CHECK(dest_descriptor);
+    dim3 block_size(32,4);
 
-    // double buffer for now
-    size_t shmem_size_bytes =
-        (BLOCK_TILE_DIM)*NUM_WARPS_PER_BLOCK * BLOCK_TILE_DIM * sizeof(bf16) + sizeof(uint64_t);
+    int num_blocks_m = CEIL_DIV(ARR_M, TILE_M);
+    int num_blocks_n = CEIL_DIV(ARR_N, TILE_N * 32);
+
+    dim3 grid(num_blocks_n, num_blocks_m); // NOTE: n = x, m = y
+
+    uint32_t shmem_size_bytes = ((THREADS_PER_WARP * TILE_M * TILE_N * sizeof(bf16)) + sizeof(uint64_t));
+
     CUDA_CHECK(cudaFuncSetAttribute(
-        tma_copy, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shmem_size_bytes));
+            tma_copy,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shmem_size_bytes));
 
-    // printf("shmem_size_bytes = %zu\n", shmem_size_bytes);
-
-    int num_blocks = CEIL_DIV(N, BLOCK_TILE_DIM * BLOCK_TILE_ROWS);
-    // printf("Launching %d blocks for TMA copy\n", num_blocks);
-    tma_copy<<<num_blocks, NUM_WARPS_PER_BLOCK * 32, shmem_size_bytes>>>(
-        src_map, dest_map, N);
+    tma_copy<<<grid, block_size, shmem_size_bytes>>>(src_map, dest_map, N);
 }
 
 /// <--- /your code here --->
@@ -153,8 +197,7 @@ void launch_tma_copy(bf16 *dest, bf16 *src, int N)
 
 const int elem_per_block = 16384;
 __global__ void simple_vector_copy(bf16 *__restrict__ dest,
-                                   const bf16 *__restrict__ src, int N)
-{
+                                   const bf16 *__restrict__ src, int N) {
     constexpr int VEC_ELEMS = 8;
     using VecT = uint4;
 
@@ -164,44 +207,39 @@ __global__ void simple_vector_copy(bf16 *__restrict__ dest,
     const VecT *src_vec = reinterpret_cast<const VecT *>(src);
     VecT *dest_vec = reinterpret_cast<VecT *>(dest);
 
-    for (int i = threadIdx.x; i < blockDim.x * total_vecs; i += blockDim.x)
-    {
+    for (int i = threadIdx.x; i < blockDim.x * total_vecs; i += blockDim.x) {
         dest_vec[start_vec + i] = src_vec[start_vec + i];
     }
 }
 
-#define BENCHMARK_KERNEL(kernel_call, num_iters, size_bytes, label)       \
-    do                                                                    \
-    {                                                                     \
-        cudaEvent_t start, stop;                                          \
-        CUDA_CHECK(cudaEventCreate(&start));                              \
-        CUDA_CHECK(cudaEventCreate(&stop));                               \
-        CUDA_CHECK(cudaEventRecord(start));                               \
-        for (int i = 0; i < num_iters; i++)                               \
-        {                                                                 \
-            kernel_call;                                                  \
-        }                                                                 \
-        CUDA_CHECK(cudaEventRecord(stop));                                \
-        CUDA_CHECK(cudaEventSynchronize(stop));                           \
-        float elapsed_time;                                               \
-        CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));     \
-        float time_per_iter = elapsed_time / num_iters;                   \
-        float bandwidth_gb_s = (2.0 * size_bytes * 1e-6 / time_per_iter); \
-        printf("%s - Time: %.4f ms, Bandwidth: %.2f GB/s\n", label,       \
-               time_per_iter, bandwidth_gb_s);                            \
-        CUDA_CHECK(cudaEventDestroy(start));                              \
-        CUDA_CHECK(cudaEventDestroy(stop));                               \
+#define BENCHMARK_KERNEL(kernel_call, num_iters, size_bytes, label)            \
+    do {                                                                       \
+        cudaEvent_t start, stop;                                               \
+        CUDA_CHECK(cudaEventCreate(&start));                                   \
+        CUDA_CHECK(cudaEventCreate(&stop));                                    \
+        CUDA_CHECK(cudaEventRecord(start));                                    \
+        for (int i = 0; i < num_iters; i++) {                                  \
+            kernel_call;                                                       \
+        }                                                                      \
+        CUDA_CHECK(cudaEventRecord(stop));                                     \
+        CUDA_CHECK(cudaEventSynchronize(stop));                                \
+        float elapsed_time;                                                    \
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));          \
+        float time_per_iter = elapsed_time / num_iters;                        \
+        float bandwidth_gb_s = (2.0 * size_bytes * 1e-6 / time_per_iter);      \
+        printf("%s - Time: %.4f ms, Bandwidth: %.2f GB/s\n", label,            \
+               time_per_iter, bandwidth_gb_s);                                 \
+        CUDA_CHECK(cudaEventDestroy(start));                                   \
+        CUDA_CHECK(cudaEventDestroy(stop));                                    \
     } while (0)
 
-int main()
-{
+int main() {
     const size_t size = 132 * 10 * 32 * 128 * 128;
 
     // Allocate and initialize host memory
     bf16 *matrix = (bf16 *)malloc(size * sizeof(bf16));
     const int N = 128;
-    for (int idx = 0; idx < size; idx++)
-    {
+    for (int idx = 0; idx < size; idx++) {
         int i = idx / N;
         int j = idx % N;
         // Don't want to use a random number generator, takes too long.
@@ -228,10 +266,8 @@ int main()
                           cudaMemcpyDeviceToHost));
 
     bool tma_correct = true;
-    for (int idx = 0; idx < size; idx++)
-    {
-        if (tma_result[idx] != matrix[idx])
-        {
+    for (int idx = 0; idx < size; idx++) {
+        if (tma_result[idx] != matrix[idx]) {
             printf("First mismatch at [%d]: %.4f != %.4f\n", idx,
                    __bfloat162float(tma_result[idx]),
                    __bfloat162float(matrix[idx]));
@@ -254,10 +290,8 @@ int main()
                           cudaMemcpyDeviceToHost));
 
     bool simple_correct = true;
-    for (int idx = 0; idx < size; idx++)
-    {
-        if (simple_result[idx] != matrix[idx])
-        {
+    for (int idx = 0; idx < size; idx++) {
+        if (simple_result[idx] != matrix[idx]) {
             printf("First mismatch at [%d]: %.4f != %.4f\n", idx,
                    __bfloat162float(tma_result[idx]),
                    __bfloat162float(matrix[idx]));
@@ -273,14 +307,12 @@ int main()
     const int num_iters = 10;
     const size_t size_bytes = size * sizeof(bf16);
 
-    if (tma_correct)
-    {
+    if (tma_correct) {
         BENCHMARK_KERNEL((launch_tma_copy(d_dest, d_src, size)), num_iters,
                          size_bytes, "TMA Copy");
     }
 
-    if (simple_correct)
-    {
+    if (simple_correct) {
         BENCHMARK_KERNEL(
             (simple_vector_copy<<<size / (elem_per_block * 32), 32>>>(
                  d_dest, d_src, size),
